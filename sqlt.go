@@ -1,7 +1,7 @@
 // Package sqlt provides a type-safe SQL builder and struct mapper using Go's text/template engine.
 //
 // Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package.
-// The Dest function returns a structscan.Struct[Dest], which provides a fluent API for field-based value extraction and transformation.
+// The Dest function returns a structscan.Schema[Dest], which provides a fluent API for field-based value extraction and transformation.
 //
 // Example:
 /*
@@ -33,14 +33,14 @@ type Data struct {
 
 var query = sqlt.All[string, Data](sqlt.Parse(`
 	SELECT
-		100                                    {{ Scan.Int "Int" }}
-		, NULL                                 {{ Scan.DefaultString "String" "default" }}
-		, true                                 {{ Scan.Bool "Bool" }}
-		, {{ . }}                              {{ Scan.ParseTime "Time" DateOnly }}
-		, '300'                                {{ Scan.UnmarshalText "Big" }}
-		, 'https://example.com/path?query=yes' {{ Scan.UnmarshalBinary "URL" }}
-		, 'hello,world'                        {{ Scan.Split "Slice" "," }}
-		, '{"hello":"world"}'                  {{ Scan.UnmarshalJSON "JSON" }}
+		100                                    {{ Scan.Int.Into "Int" }}
+		, NULL                                 {{ Scan.Nullable.String.Into "String" }}
+		, true                                 {{ Scan.Bool.Into "Bool" }}
+		, {{ . }}                              {{ (Scan.String.Time DateOnly).Into "Time" }}
+		, '300'                                {{ Scan.Text.Into "Big" }}
+		, 'https://example.com/path?query=yes' {{ Scan.Binary.Into "URL" }}
+		, 'hello,world'                        {{ (Scan.String.Split ",").Into "Slice" }}
+		, '{"hello":"world"}'                  {{ Scan.JSON.Into "JSON" }}
 `))
 
 func main() {
@@ -95,7 +95,6 @@ type DB interface {
 // Fields are merged; later values override earlier ones.
 // Parsers are appended.
 type Config struct {
-	Dialect              string
 	Placeholder          func(pos int, writer io.Writer) error
 	Logger               func(ctx context.Context, info Info)
 	ExpressionSize       int
@@ -110,10 +109,6 @@ func (c Config) With(configs ...Config) Config {
 	merged := Config{}
 
 	for _, override := range append([]Config{c}, configs...) {
-		if override.Dialect != "" {
-			merged.Dialect = override.Dialect
-		}
-
 		if override.Placeholder != nil {
 			merged.Placeholder = override.Placeholder
 		}
@@ -239,24 +234,6 @@ func Funcs(fm template.FuncMap) Config {
 	}
 }
 
-// Sqlite sets the Dialect to "Sqlite" and the placeholder to "?".
-func Sqlite() Config {
-	return Dialect("Sqlite").With(Question())
-}
-
-// Postgres sets the Dialect to "Postgres" and the placeholder to "$".
-func Postgres() Config {
-	return Dialect("Postgres").With(Dollar())
-}
-
-// Dialect sets the return value of the Dialect() template function, allowing customization per database engine.
-// This does not configure placeholders; use With(Question()) or similar if needed.
-func Dialect(name string) Config {
-	return Config{
-		Dialect: name,
-	}
-}
-
 // ExpressionSize sets the number of reusable expressions to cache.
 // Avoid if your templates are non-deterministic.
 func ExpressionSize(size int) Config {
@@ -330,7 +307,7 @@ type Info struct {
 type Expression[Dest any] struct {
 	SQL    string
 	Args   []any
-	Mapper structscan.Mapper[Dest]
+	Mapper *structscan.Mapper[Dest]
 }
 
 // Raw is a string type that inserts raw SQL into a template without interpolation or escaping.
@@ -360,7 +337,12 @@ func Query[Param any](configs ...Config) Statement[Param, *sql.Rows] {
 // First returns a Statement that maps the first row from a query to Dest.
 func First[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
 	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) (Dest, error) {
-		return expr.Mapper.Row(db.QueryRowContext(ctx, expr.SQL, expr.Args...))
+		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return *new(Dest), err
+		}
+
+		return expr.Mapper.First(rows)
 	}, configs...)
 }
 
@@ -405,16 +387,19 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 
 	var (
 		location = file + ":" + strconv.Itoa(line)
-		config   = Sqlite().With(configs...)
-		schema   = structscan.New[Dest]()
+		config   = Question().With(configs...)
+		schema   = structscan.NewSchema[Dest]()
 
 		t = template.New("").Option("missingkey=invalid").Funcs(template.FuncMap{
-			"Dialect": func() string { return config.Dialect },
-			"Raw":     func(sql string) Raw { return Raw(sql) },
-			"Scan": func() structscan.Struct[Dest] {
-				return schema
-			},
+			"Raw":  func(sql string) Raw { return Raw(sql) },
+			"Scan": schema.Scan,
 
+			"Enum": func(s string, i int64) structscan.Enum {
+				return structscan.Enum{
+					String: s,
+					Int:    i,
+				}
+			},
 			"DateTime":    valueFunc(time.DateTime),
 			"DateOnly":    valueFunc(time.DateOnly),
 			"TimeOnly":    valueFunc(time.TimeOnly),
@@ -596,12 +581,12 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 
 // escapeNode rewrites template nodes to capture SQL fragments, scan targets, and arguments.
 // Inspired by https://github.com/mhilton/sqltemplate/blob/main/escape.go.
-func escapeNode[Dest any](s structscan.Struct[Dest], t *template.Template, n parse.Node) error {
+func escapeNode[Dest any](s *structscan.Schema[Dest], t *template.Template, n parse.Node) error {
 	switch v := n.(type) {
 	case *parse.ActionNode:
 		return escapeNode(s, t, v.Pipe)
 	case *parse.IfNode:
-		return twoErrors(
+		return errors.Join(
 			escapeNode(s, t, v.List),
 			escapeNode(s, t, v.ElseList),
 		)
@@ -624,14 +609,6 @@ func escapeNode[Dest any](s structscan.Struct[Dest], t *template.Template, n par
 			return nil
 		}
 
-		if len(v.Cmds[0].Args) > 0 && v.Cmds[0].Args[0].String() == "Scan" && len(v.Cmds[0].Args) > 0 {
-			if str, ok := v.Cmds[0].Args[1].(*parse.StringNode); ok {
-				if _, err := s.Field(str.Text); err != nil {
-					return err
-				}
-			}
-		}
-
 		cmd := v.Cmds[len(v.Cmds)-1]
 		if len(cmd.Args) == 1 && cmd.Args[0].Type() == parse.NodeIdentifier && cmd.Args[0].(*parse.IdentifierNode).Ident == ident {
 			return nil
@@ -642,12 +619,12 @@ func escapeNode[Dest any](s structscan.Struct[Dest], t *template.Template, n par
 			Args:     []parse.Node{parse.NewIdentifier(ident).SetTree(t.Tree).SetPos(cmd.Pos)},
 		})
 	case *parse.RangeNode:
-		return twoErrors(
+		return errors.Join(
 			escapeNode(s, t, v.List),
 			escapeNode(s, t, v.ElseList),
 		)
 	case *parse.WithNode:
-		return twoErrors(
+		return errors.Join(
 			escapeNode(s, t, v.List),
 			escapeNode(s, t, v.ElseList),
 		)
@@ -679,10 +656,15 @@ func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
 		return Expression[Dest]{}, err
 	}
 
+	mapper, err := structscan.NewMapper(r.scanners...)
+	if err != nil {
+		return Expression[Dest]{}, err
+	}
+
 	expr := Expression[Dest]{
 		SQL:    r.sqlWriter.String(),
 		Args:   slices.Clone(r.args),
-		Mapper: structscan.Map(r.scanners...),
+		Mapper: mapper,
 	}
 
 	r.sqlWriter.Reset()
@@ -733,16 +715,4 @@ func valueFunc[T any](t T) func() T {
 	return func() T {
 		return t
 	}
-}
-
-func twoErrors(err1, err2 error) error {
-	if err1 == nil {
-		return err2
-	}
-
-	if err2 == nil {
-		return err1
-	}
-
-	return errors.Join(err1, err2)
 }

@@ -10,7 +10,7 @@ go get -u github.com/go-sqlt/sqlt
 
 `sqlt` uses Go’s template engine to create a flexible, powerful, and type-safe SQL builder and struct mapper.  
 
-Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function returns a `structscan.Struct[Dest]`, which provides a fluent API for field-based value extraction and transformation.
+Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function returns a `structscan.Schema[Dest]`, which provides a fluent API for field-based value extraction and transformation.
 
 ## Example
 
@@ -42,14 +42,14 @@ type Data struct {
 
 var query = sqlt.All[string, Data](sqlt.Parse(`
 	SELECT
-		100                                    {{ Scan.Int "Int" }}
-		, NULL                                 {{ Scan.DefaultString "String" "default" }}
-		, true                                 {{ Scan.Bool "Bool" }}
-		, {{ . }}                              {{ Scan.ParseTime "Time" DateOnly }}
-		, '300'                                {{ Scan.UnmarshalText "Big" }}
-		, 'https://example.com/path?query=yes' {{ Scan.UnmarshalBinary "URL" }}
-		, 'hello,world'                        {{ Scan.Split "Slice" "," }}
-		, '{"hello":"world"}'                  {{ Scan.UnmarshalJSON "JSON" }}
+		100                                    {{ Scan.Int.Into "Int" }}
+		, NULL                                 {{ Scan.Nullable.String.Into "String" }}
+		, true                                 {{ Scan.Bool.Into "Bool" }}
+		, {{ . }}                              {{ (Scan.String.Time DateOnly).Into "Time" }}
+		, '300'                                {{ Scan.Text.Into "Big" }}
+		, 'https://example.com/path?query=yes' {{ Scan.Binary.Into "URL" }}
+		, 'hello,world'                        {{ (Scan.String.Split ",").Into "Slice" }}
+		, '{"hello":"world"}'                  {{ Scan.JSON.Into "JSON" }}
 `))
 
 func main() {
@@ -63,7 +63,6 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println(data)
-	// [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
+	fmt.Println(data) // [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
 }
 ```
