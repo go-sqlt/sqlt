@@ -2,7 +2,7 @@
 
 [![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/go-sqlt/sqlt)
 [![GitHub tag (latest SemVer)](https://img.shields.io/github/tag/go-sqlt/sqlt.svg?style=social)](https://github.com/go-sqlt/sqlt/tags)
-[![Coverage](https://img.shields.io/badge/Coverage-66.1%25-yellow)](https://github.com/go-sqlt/sqlt/actions)
+[![Coverage](https://img.shields.io/badge/Coverage-68.3%25-yellow)](https://github.com/go-sqlt/sqlt/actions)
 
 ```go
 go get -u github.com/go-sqlt/sqlt
