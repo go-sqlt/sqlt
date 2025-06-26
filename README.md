@@ -42,14 +42,14 @@ type Data struct {
 
 var query = sqlt.All[string, Data](sqlt.Parse(`
 	SELECT
-		100                                    {{ Scan.Int.Into "Int" }}
-		, NULL                                 {{ Scan.Nullable.String.Into "String" }}
-		, true                                 {{ Scan.Bool.Into "Bool" }}
-		, {{ . }}                              {{ (Scan.String.Time DateOnly).Into "Time" }}
-		, '300'                                {{ Scan.Text.Into "Big" }}
-		, 'https://example.com/path?query=yes' {{ Scan.Binary.Into "URL" }}
-		, 'hello,world'                        {{ (Scan.String.Split ",").Into "Slice" }}
-		, '{"hello":"world"}'                  {{ Scan.JSON.Into "JSON" }}
+		100                                    {{ Scan.Int.To "Int" }}
+		, NULL                                 {{ Scan.Nullable.String.To "String" }}
+		, true                                 {{ Scan.Bool.To "Bool" }}
+		, {{ . }}                              {{ (Scan.String.Time DateOnly).To "Time" }}
+		, '300'                                {{ Scan.Text.To "Big" }}
+		, 'https://example.com/path?query=yes' {{ Scan.Binary.To "URL" }}
+		, 'hello,world'                        {{ (Scan.String.Split ",").To "Slice" }}
+		, '{"hello":"world"}'                  {{ Scan.JSON.To "JSON" }}
 `))
 
 func main() {

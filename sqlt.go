@@ -33,14 +33,14 @@ type Data struct {
 
 var query = sqlt.All[string, Data](sqlt.Parse(`
 	SELECT
-		100                                    {{ Scan.Int.Into "Int" }}
-		, NULL                                 {{ Scan.Nullable.String.Into "String" }}
-		, true                                 {{ Scan.Bool.Into "Bool" }}
-		, {{ . }}                              {{ (Scan.String.Time DateOnly).Into "Time" }}
-		, '300'                                {{ Scan.Text.Into "Big" }}
-		, 'https://example.com/path?query=yes' {{ Scan.Binary.Into "URL" }}
-		, 'hello,world'                        {{ (Scan.String.Split ",").Into "Slice" }}
-		, '{"hello":"world"}'                  {{ Scan.JSON.Into "JSON" }}
+		100                                    {{ Scan.Int.To "Int" }}
+		, NULL                                 {{ Scan.Nullable.String.To "String" }}
+		, true                                 {{ Scan.Bool.To "Bool" }}
+		, {{ . }}                              {{ (Scan.String.Time DateOnly).To "Time" }}
+		, '300'                                {{ Scan.Text.To "Big" }}
+		, 'https://example.com/path?query=yes' {{ Scan.Binary.To "URL" }}
+		, 'hello,world'                        {{ (Scan.String.Split ",").To "Slice" }}
+		, '{"hello":"world"}'                  {{ Scan.JSON.To "JSON" }}
 `))
 
 func main() {
@@ -54,8 +54,7 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println(data)
-	// [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
+	fmt.Println(data) // [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
 }
 
 */
@@ -66,20 +65,22 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"text/template"
 	"text/template/parse"
 	"time"
+	"unicode"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/go-sqlt/datahash"
 	"github.com/go-sqlt/structscan"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/jackc/pgtype"
 	"github.com/jba/templatecheck"
 )
 
@@ -95,7 +96,7 @@ type DB interface {
 // Fields are merged; later values override earlier ones.
 // Parsers are appended.
 type Config struct {
-	Placeholder          func(pos int, writer io.Writer) error
+	Placeholder          func(pos int, builder *strings.Builder) error
 	Logger               func(ctx context.Context, info Info)
 	ExpressionSize       int
 	ExpressionExpiration time.Duration
@@ -253,8 +254,8 @@ func ExpressionExpiration(expiration time.Duration) Config {
 // StaticPlaceholder uses the same placeholder string for all parameters (e.g., "?").
 func StaticPlaceholder(p string) Config {
 	return Config{
-		Placeholder: func(_ int, writer io.Writer) error {
-			_, err := writer.Write([]byte(p))
+		Placeholder: func(_ int, builder *strings.Builder) error {
+			_, err := builder.WriteString(p)
 
 			return err
 		},
@@ -264,8 +265,8 @@ func StaticPlaceholder(p string) Config {
 // PositionalPlaceholder formats placeholders using a prefix and 1-based index (e.g., "$1", ":1", "@p1").
 func PositionalPlaceholder(p string) Config {
 	return Config{
-		Placeholder: func(pos int, writer io.Writer) error {
-			_, err := writer.Write([]byte(p + strconv.Itoa(pos)))
+		Placeholder: func(pos int, builder *strings.Builder) error {
+			_, err := builder.WriteString(p + strconv.Itoa(pos))
 
 			return err
 		},
@@ -303,6 +304,33 @@ type Info struct {
 	Cached   bool
 }
 
+// CollapsedSQL removes double whitespace for logging.
+func (i Info) CollapsedSQL() string {
+	var builder strings.Builder
+
+	builder.Grow(len(i.SQL))
+
+	space := false
+
+	for _, r := range i.SQL {
+		if unicode.IsSpace(r) {
+			space = true
+
+			continue
+		}
+
+		if space {
+			_ = builder.WriteByte(' ')
+
+			space = false
+		}
+
+		_, _ = builder.WriteRune(r)
+	}
+
+	return strings.TrimSpace(builder.String())
+}
+
 // Expression holds the rendered SQL, arguments, and row mapper.
 type Expression[Dest any] struct {
 	SQL    string
@@ -337,12 +365,7 @@ func Query[Param any](configs ...Config) Statement[Param, *sql.Rows] {
 // First returns a Statement that maps the first row from a query to Dest.
 func First[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
 	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) (Dest, error) {
-		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
-		if err != nil {
-			return *new(Dest), err
-		}
-
-		return expr.Mapper.First(rows)
+		return expr.Mapper.QueryFirst(ctx, db, expr.SQL, expr.Args...)
 	}, configs...)
 }
 
@@ -350,24 +373,14 @@ func First[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
 // It returns an structscan.ErrTooManyRows if more than one row is returned.
 func One[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
 	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) (Dest, error) {
-		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
-		if err != nil {
-			return *new(Dest), err
-		}
-
-		return expr.Mapper.One(rows)
+		return expr.Mapper.QueryOne(ctx, db, expr.SQL, expr.Args...)
 	}, configs...)
 }
 
 // All returns a Statement that maps all rows in the result set to a slice of Dest.
 func All[Param any, Dest any](configs ...Config) Statement[Param, []Dest] {
 	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) ([]Dest, error) {
-		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
-		if err != nil {
-			return nil, err
-		}
-
-		return expr.Mapper.All(rows)
+		return expr.Mapper.QueryAll(ctx, db, expr.SQL, expr.Args...)
 	}, configs...)
 }
 
@@ -380,6 +393,31 @@ type Statement[Param, Result any] interface {
 // This allows advanced behavior such as custom row scanning or side effects.
 func Custom[Param any, Dest any, Result any](exec func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error), configs ...Config) Statement[Param, Result] {
 	return newStmt[Param](exec, configs...)
+}
+
+var Global = map[string]any{
+	"DateTime":    valueFunc(time.DateTime),
+	"DateOnly":    valueFunc(time.DateOnly),
+	"TimeOnly":    valueFunc(time.TimeOnly),
+	"RFC3339":     valueFunc(time.RFC3339),
+	"RFC3339Nano": valueFunc(time.RFC3339Nano),
+	"Layout":      valueFunc(time.Layout),
+	"ANSIC":       valueFunc(time.ANSIC),
+	"UnixDate":    valueFunc(time.UnixDate),
+	"RubyDate":    valueFunc(time.RubyDate),
+	"RFC822":      valueFunc(time.RFC822),
+	"RFC822Z":     valueFunc(time.RFC822Z),
+	"RFC850":      valueFunc(time.RFC850),
+	"RFC1123":     valueFunc(time.RFC1123),
+	"RFC1123Z":    valueFunc(time.RFC1123Z),
+	"Kitchen":     valueFunc(time.Kitchen),
+	"Stamp":       valueFunc(time.Stamp),
+	"StampMilli":  valueFunc(time.StampMilli),
+	"StampMicro":  valueFunc(time.StampMicro),
+	"StampNano":   valueFunc(time.StampNano),
+	"UTC":         valueFunc(time.UTC),
+	"Local":       valueFunc(time.Local), //nolint:gosmopolitan
+	"TextArray":   valueFunc(&pgtype.TextArray{}),
 }
 
 func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error), configs ...Config) Statement[Param, Result] {
@@ -400,28 +438,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 					Int:    i,
 				}
 			},
-			"DateTime":    valueFunc(time.DateTime),
-			"DateOnly":    valueFunc(time.DateOnly),
-			"TimeOnly":    valueFunc(time.TimeOnly),
-			"RFC3339":     valueFunc(time.RFC3339),
-			"RFC3339Nano": valueFunc(time.RFC3339Nano),
-			"Layout":      valueFunc(time.Layout),
-			"ANSIC":       valueFunc(time.ANSIC),
-			"UnixDate":    valueFunc(time.UnixDate),
-			"RubyDate":    valueFunc(time.RubyDate),
-			"RFC822":      valueFunc(time.RFC822),
-			"RFC822Z":     valueFunc(time.RFC822Z),
-			"RFC850":      valueFunc(time.RFC850),
-			"RFC1123":     valueFunc(time.RFC1123),
-			"RFC1123Z":    valueFunc(time.RFC1123Z),
-			"Kitchen":     valueFunc(time.Kitchen),
-			"Stamp":       valueFunc(time.Stamp),
-			"StampMilli":  valueFunc(time.StampMilli),
-			"StampMicro":  valueFunc(time.StampMicro),
-			"StampNano":   valueFunc(time.StampNano),
-			"UTC":         valueFunc(time.UTC),
-			"Local":       valueFunc(time.Local), //nolint:gosmopolitan
-		})
+		}).Funcs(Global)
 		err error
 	)
 
@@ -451,17 +468,19 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 			tc, _ := t.Clone()
 
 			r := &runner[Param, Dest]{
-				tpl:       tc,
-				sqlWriter: &sqlWriter{},
+				tpl:     tc,
+				builder: &strings.Builder{},
 			}
+
+			r.builder.Grow(512)
 
 			r.tpl.Funcs(template.FuncMap{
 				ident: func(arg any) (Raw, error) {
 					switch a := arg.(type) {
 					case Raw:
-						r.sqlWriter.data = append(r.sqlWriter.data, []byte(a)...)
+						_, err := r.builder.WriteString(string(a))
 
-						return "", nil
+						return "", err
 					case structscan.Scanner[Dest]:
 						r.scanners = append(r.scanners, a)
 
@@ -469,7 +488,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 					default:
 						r.args = append(r.args, arg)
 
-						return "", config.Placeholder(len(r.args), r.sqlWriter)
+						return "", config.Placeholder(len(r.args), r.builder)
 					}
 				},
 			})
@@ -644,15 +663,15 @@ const ident = "__sqlt__"
 
 // runner holds the state for a single template execution.
 type runner[Param any, Dest any] struct {
-	tpl       *template.Template
-	sqlWriter *sqlWriter
-	args      []any
-	scanners  []structscan.Scanner[Dest]
+	tpl      *template.Template
+	builder  *strings.Builder
+	args     []any
+	scanners []structscan.Scanner[Dest]
 }
 
 // expr renders the template and collects SQL, args, and structscan mappers.
 func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
-	if err := r.tpl.Execute(r.sqlWriter, param); err != nil {
+	if err := r.tpl.Execute(r.builder, param); err != nil {
 		return Expression[Dest]{}, err
 	}
 
@@ -662,52 +681,16 @@ func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
 	}
 
 	expr := Expression[Dest]{
-		SQL:    r.sqlWriter.String(),
+		SQL:    r.builder.String(),
 		Args:   slices.Clone(r.args),
 		Mapper: mapper,
 	}
 
-	r.sqlWriter.Reset()
+	r.builder.Reset()
 	r.args = r.args[:0]
 	r.scanners = r.scanners[:0]
 
 	return expr, nil
-}
-
-// sqlWriter accumulates SQL output with normalization (collapses whitespace).
-type sqlWriter struct {
-	data []byte
-}
-
-func (w *sqlWriter) Write(data []byte) (int, error) {
-	for _, b := range data {
-		switch b {
-		case '\t', '\n', '\v', '\f', '\r', ' ', 0x85, 0xA0:
-			if len(w.data) > 0 && w.data[len(w.data)-1] != ' ' {
-				w.data = append(w.data, ' ')
-			}
-		default:
-			w.data = append(w.data, b)
-		}
-	}
-
-	return len(data), nil
-}
-
-func (w *sqlWriter) Reset() {
-	w.data = w.data[:0]
-}
-
-func (w *sqlWriter) String() string {
-	n := len(w.data)
-
-	if n == 0 {
-		return ""
-	} else if w.data[n-1] == ' ' {
-		n--
-	}
-
-	return string(w.data[:n])
 }
 
 // valueFunc wraps a value as a no-arg template function returning it.
