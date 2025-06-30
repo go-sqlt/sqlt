@@ -6,9 +6,9 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/go-sqlt/datahash v0.0.11
 	github.com/go-sqlt/structscan v0.0.14
-	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgtype v1.14.4
 	github.com/jba/templatecheck v0.7.1
+	github.com/maypok86/otter/v2 v2.1.0
 	modernc.org/sqlite v1.38.0
 )
 

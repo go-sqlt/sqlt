@@ -79,9 +79,9 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/go-sqlt/datahash"
 	"github.com/go-sqlt/structscan"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jackc/pgtype"
 	"github.com/jba/templatecheck"
+	"github.com/maypok86/otter/v2"
 )
 
 // DB defines the subset of database operations required by sqlt.
@@ -396,28 +396,32 @@ func Custom[Param any, Dest any, Result any](exec func(ctx context.Context, db D
 }
 
 var Global = map[string]any{
-	"DateTime":    valueFunc(time.DateTime),
-	"DateOnly":    valueFunc(time.DateOnly),
-	"TimeOnly":    valueFunc(time.TimeOnly),
-	"RFC3339":     valueFunc(time.RFC3339),
-	"RFC3339Nano": valueFunc(time.RFC3339Nano),
-	"Layout":      valueFunc(time.Layout),
-	"ANSIC":       valueFunc(time.ANSIC),
-	"UnixDate":    valueFunc(time.UnixDate),
-	"RubyDate":    valueFunc(time.RubyDate),
-	"RFC822":      valueFunc(time.RFC822),
-	"RFC822Z":     valueFunc(time.RFC822Z),
-	"RFC850":      valueFunc(time.RFC850),
-	"RFC1123":     valueFunc(time.RFC1123),
-	"RFC1123Z":    valueFunc(time.RFC1123Z),
-	"Kitchen":     valueFunc(time.Kitchen),
-	"Stamp":       valueFunc(time.Stamp),
-	"StampMilli":  valueFunc(time.StampMilli),
-	"StampMicro":  valueFunc(time.StampMicro),
-	"StampNano":   valueFunc(time.StampNano),
-	"UTC":         valueFunc(time.UTC),
-	"Local":       valueFunc(time.Local), //nolint:gosmopolitan
-	"TextArray":   valueFunc(&pgtype.TextArray{}),
+	"DateTime":    func() string { return time.DateTime },
+	"DateOnly":    func() string { return time.DateOnly },
+	"TimeOnly":    func() string { return time.TimeOnly },
+	"RFC3339":     func() string { return time.RFC3339 },
+	"RFC3339Nano": func() string { return time.RFC3339Nano },
+	"Layout":      func() string { return time.Layout },
+	"ANSIC":       func() string { return time.ANSIC },
+	"UnixDate":    func() string { return time.UnixDate },
+	"RubyDate":    func() string { return time.RubyDate },
+	"RFC822":      func() string { return time.RFC822 },
+	"RFC822Z":     func() string { return time.RFC822Z },
+	"RFC850":      func() string { return time.RFC850 },
+	"RFC1123":     func() string { return time.RFC1123 },
+	"RFC1123Z":    func() string { return time.RFC1123Z },
+	"Kitchen":     func() string { return time.Kitchen },
+	"Stamp":       func() string { return time.Stamp },
+	"StampMilli":  func() string { return time.StampMilli },
+	"StampMicro":  func() string { return time.StampMicro },
+	"StampNano":   func() string { return time.StampNano },
+	"UTC":         func() *time.Location { return time.UTC },
+	"Local":       func() *time.Location { return time.Local }, //nolint:gosmopolitan
+	"TextArray": func() func() structscan.Assigner {
+		return func() structscan.Assigner {
+			return &pgtype.TextArray{}
+		}
+	},
 }
 
 func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error), configs ...Config) Statement[Param, Result] {
@@ -497,10 +501,23 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 		},
 	}
 
-	var cache *expirable.LRU[uint64, Expression[Dest]]
+	var cache *otter.Cache[uint64, Expression[Dest]]
 
 	if config.ExpressionSize > 0 || config.ExpressionExpiration > 0 {
-		cache = expirable.NewLRU[uint64, Expression[Dest]](config.ExpressionSize, nil, config.ExpressionExpiration)
+		opts := &otter.Options[uint64, Expression[Dest]]{}
+
+		if config.ExpressionSize > 0 {
+			opts.MaximumSize = config.ExpressionSize
+		}
+
+		if config.ExpressionExpiration > 0 {
+			opts.ExpiryCalculator = otter.ExpiryAccessing[uint64, Expression[Dest]](config.ExpressionExpiration)
+		}
+
+		cache, err = otter.New(opts)
+		if err != nil {
+			panic(fmt.Errorf("statement at %s: create expression cache: %w", location, err))
+		}
 
 		if config.Hasher == nil {
 			hasher := datahash.New(xxhash.New, datahash.Options{})
@@ -530,7 +547,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 type statement[Param any, Dest any, Result any] struct {
 	name     string
 	location string
-	cache    *expirable.LRU[uint64, Expression[Dest]]
+	cache    *otter.Cache[uint64, Expression[Dest]]
 	exec     func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error)
 	pool     *sync.Pool
 	logger   func(ctx context.Context, info Info)
@@ -566,7 +583,7 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 			return result, fmt.Errorf("statement at %s: hashing param: %w", s.location, err)
 		}
 
-		expr, cached = s.cache.Get(hash)
+		expr, cached = s.cache.GetIfPresent(hash)
 		if cached {
 			result, err = s.exec(ctx, db, expr)
 			if err != nil {
@@ -581,13 +598,17 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 
 	expr, err = r.expr(param)
 	if err != nil {
+		r.reset()
+		s.pool.Put(r)
+
 		return result, fmt.Errorf("statement at %s: expression: %w", s.location, err)
 	}
 
+	r.reset()
 	s.pool.Put(r)
 
 	if s.cache != nil {
-		_ = s.cache.Add(hash, expr)
+		_, _ = s.cache.Set(hash, expr)
 	}
 
 	result, err = s.exec(ctx, db, expr)
@@ -686,16 +707,11 @@ func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
 		Mapper: mapper,
 	}
 
-	r.builder.Reset()
-	r.args = r.args[:0]
-	r.scanners = r.scanners[:0]
-
 	return expr, nil
 }
 
-// valueFunc wraps a value as a no-arg template function returning it.
-func valueFunc[T any](t T) func() T {
-	return func() T {
-		return t
-	}
+func (r *runner[Param, Dest]) reset() {
+	r.builder.Reset()
+	r.args = r.args[:0]
+	r.scanners = r.scanners[:0]
 }

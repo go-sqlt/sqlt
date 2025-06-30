@@ -22,7 +22,7 @@ linters:
     - err113
     - depguard
     - cyclop
-
+    - nestif
   exclusions:
     paths-except:
       - main.go
