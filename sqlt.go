@@ -36,7 +36,7 @@ var query = sqlt.All[string, Data](sqlt.Parse(`
 		100                                    {{ Scan.Int.To "Int" }}
 		, NULL                                 {{ Scan.Nullable.String.To "String" }}
 		, true                                 {{ Scan.Bool.To "Bool" }}
-		, {{ . }}                              {{ (Scan.String.Time DateOnly).To "Time" }}
+		, {{ . }}                              {{ (Scan.String.ParseTime DateOnly).To "Time" }}
 		, '300'                                {{ Scan.Text.To "Big" }}
 		, 'https://example.com/path?query=yes' {{ Scan.Binary.To "URL" }}
 		, 'hello,world'                        {{ (Scan.String.Split ",").To "Slice" }}
@@ -54,7 +54,7 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println(data) // [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
+	fmt.Println(data) // [{100  true 2025-07-09 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
 }
 
 */
@@ -441,32 +441,37 @@ func Custom[Param any, Dest any, Result any](exec func(ctx context.Context, db D
 	return newStmt[Param](true, exec, configs...)
 }
 
+// PgxStatement can be used with pgx connection or pool.
 type PgxStatement[Param, Result any] interface {
 	Exec(ctx context.Context, db Pgx, param Param) (Result, error)
 }
 
-// Exec returns a Statement that executes a SQL statement without returning rows.
+// ExecPgx returns a PgxStatement that executes a SQL statement without returning rows.
+// Dollar placeholder is used by default.
 func ExecPgx[Param any](configs ...Config) PgxStatement[Param, pgconn.CommandTag] {
 	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgconn.CommandTag, error) {
 		return db.Exec(ctx, expr.SQL, expr.Args...)
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// QueryRow returns a Statement that runs the query and returns a single *sql.Row.
+// QueryRowPgx returns a PgxStatement that runs the query and returns a single *sql.Row.
+// Dollar placeholder is used by default.
 func QueryRowPgx[Param any](configs ...Config) PgxStatement[Param, pgx.Row] {
 	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgx.Row, error) {
 		return db.QueryRow(ctx, expr.SQL, expr.Args...), nil
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// Query returns a Statement that runs the query and returns *sql.Rows.
+// QueryPgx returns a PgxStatement that runs the query and returns *sql.Rows.
+// Dollar placeholder is used by default.
 func QueryPgx[Param any](configs ...Config) PgxStatement[Param, pgx.Rows] {
 	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgx.Rows, error) {
 		return db.Query(ctx, expr.SQL, expr.Args...)
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// First returns a Statement that maps the first row from a query to Dest.
+// FirstPgx returns a PgxStatement that maps the first row from a query to Dest.
+// Dollar placeholder is used by default.
 func FirstPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] {
 	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) (Dest, error) {
 		rows, err := db.Query(ctx, expr.SQL, expr.Args...)
@@ -477,10 +482,11 @@ func FirstPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] 
 		defer rows.Close()
 
 		return expr.Schema.First(rows)
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// One returns a Statement that expects exactly one row in the result set.
+// OnePgx returns a PgxStatement that expects exactly one row in the result set.
+// Dollar placeholder is used by default.
 // It returns an structscan.ErrTooManyRows if more than one row is returned.
 func OnePgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] {
 	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) (Dest, error) {
@@ -492,10 +498,11 @@ func OnePgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] {
 		defer rows.Close()
 
 		return expr.Schema.One(rows)
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// All returns a Statement that maps all rows in the result set to a slice of Dest.
+// AllPgx returns a PgxStatement that maps all rows in the result set to a slice of Dest.
+// Dollar placeholder is used by default.
 func AllPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, []Dest] {
 	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) ([]Dest, error) {
 		rows, err := db.Query(ctx, expr.SQL, expr.Args...)
@@ -506,13 +513,14 @@ func AllPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, []Dest] 
 		defer rows.Close()
 
 		return expr.Schema.All(rows)
-	}, configs...)
+	}, Dollar().With(configs...))
 }
 
-// Custom creates a Statement using the provided function to execute the rendered SQL expression.
+// CustomPgx creates a PgxStatement using the provided function to execute the rendered SQL expression.
+// Dollar placeholder is used by default.
 // This allows advanced behavior such as custom row scanning or side effects.
 func CustomPgx[Param any, Dest any, Result any](exec func(ctx context.Context, db Pgx, expr Expression[Dest]) (Result, error), configs ...Config) PgxStatement[Param, Result] {
-	return newStmt[Param](true, exec, configs...)
+	return newStmt[Param](true, exec, Dollar().With(configs...))
 }
 
 func newStmt[Param any, Dest any, Result any, Database any](withScanners bool, exec func(ctx context.Context, db Database, expr Expression[Dest]) (Result, error), configs ...Config) *statement[Param, Dest, Result, Database] {
@@ -522,7 +530,7 @@ func newStmt[Param any, Dest any, Result any, Database any](withScanners bool, e
 		location = file + ":" + strconv.Itoa(line)
 		config   = Question().With(configs...)
 
-		t = template.New("").Option("missingkey=invalid").Funcs(template.FuncMap{
+		t = template.New("").Funcs(template.FuncMap{
 			"Raw": func(sql string) Raw { return Raw(sql) },
 		})
 		err error
