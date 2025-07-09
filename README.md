@@ -10,7 +10,7 @@ go get -u github.com/go-sqlt/sqlt
 
 `sqlt` uses Go’s template engine to create a flexible, powerful, and type-safe SQL builder and struct mapper.  
 
-Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function returns a `structscan.Schema[Dest]`, which provides a fluent API for field-based value extraction and transformation.
+Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function (`== structscan.Scan()`) provides a fluent API for field-based value extraction and transformation.
 
 ## Example
 
