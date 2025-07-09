@@ -5,7 +5,7 @@ go 1.24.2
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/go-sqlt/datahash v0.0.11
-	github.com/go-sqlt/structscan v0.0.16
+	github.com/go-sqlt/structscan v0.0.17
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/jba/templatecheck v0.7.1
 	modernc.org/sqlite v1.38.0
