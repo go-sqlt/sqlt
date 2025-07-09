@@ -79,9 +79,10 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/go-sqlt/datahash"
 	"github.com/go-sqlt/structscan"
-	"github.com/jackc/pgtype"
+	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jba/templatecheck"
-	"github.com/maypok86/otter/v2"
 )
 
 // DB defines the subset of database operations required by sqlt.
@@ -90,6 +91,12 @@ type DB interface {
 	QueryContext(ctx context.Context, sql string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, sql string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, sql string, args ...any) (sql.Result, error)
+}
+
+type Pgx interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // Config defines options for SQL template parsing and execution.
@@ -335,116 +342,225 @@ func (i Info) CollapsedSQL() string {
 type Expression[Dest any] struct {
 	SQL    string
 	Args   []any
-	Mapper *structscan.Mapper[Dest]
+	Schema *structscan.Schema[Dest]
 }
 
 // Raw is a string type that inserts raw SQL into a template without interpolation or escaping.
 type Raw string
-
-// Exec returns a Statement that executes a SQL statement without returning rows.
-func Exec[Param any](configs ...Config) Statement[Param, sql.Result] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[any]) (sql.Result, error) {
-		return db.ExecContext(ctx, expr.SQL, expr.Args...)
-	}, configs...)
-}
-
-// QueryRow returns a Statement that runs the query and returns a single *sql.Row.
-func QueryRow[Param any](configs ...Config) Statement[Param, *sql.Row] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[any]) (*sql.Row, error) {
-		return db.QueryRowContext(ctx, expr.SQL, expr.Args...), nil
-	}, configs...)
-}
-
-// Query returns a Statement that runs the query and returns *sql.Rows.
-func Query[Param any](configs ...Config) Statement[Param, *sql.Rows] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[any]) (*sql.Rows, error) {
-		return db.QueryContext(ctx, expr.SQL, expr.Args...)
-	}, configs...)
-}
-
-// First returns a Statement that maps the first row from a query to Dest.
-func First[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) (Dest, error) {
-		return expr.Mapper.QueryFirst(ctx, db, expr.SQL, expr.Args...)
-	}, configs...)
-}
-
-// One returns a Statement that expects exactly one row in the result set.
-// It returns an structscan.ErrTooManyRows if more than one row is returned.
-func One[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) (Dest, error) {
-		return expr.Mapper.QueryOne(ctx, db, expr.SQL, expr.Args...)
-	}, configs...)
-}
-
-// All returns a Statement that maps all rows in the result set to a slice of Dest.
-func All[Param any, Dest any](configs ...Config) Statement[Param, []Dest] {
-	return newStmt[Param](func(ctx context.Context, db DB, expr Expression[Dest]) ([]Dest, error) {
-		return expr.Mapper.QueryAll(ctx, db, expr.SQL, expr.Args...)
-	}, configs...)
-}
 
 // Statement is a compiled SQL template that runs with parameters and a DB.
 type Statement[Param, Result any] interface {
 	Exec(ctx context.Context, db DB, param Param) (Result, error)
 }
 
+// Exec returns a Statement that executes a SQL statement without returning rows.
+func Exec[Param any](configs ...Config) Statement[Param, sql.Result] {
+	return newStmt[Param](false, func(ctx context.Context, db DB, expr Expression[any]) (sql.Result, error) {
+		return db.ExecContext(ctx, expr.SQL, expr.Args...)
+	}, configs...)
+}
+
+// QueryRow returns a Statement that runs the query and returns a single *sql.Row.
+func QueryRow[Param any](configs ...Config) Statement[Param, *sql.Row] {
+	return newStmt[Param](false, func(ctx context.Context, db DB, expr Expression[any]) (*sql.Row, error) {
+		return db.QueryRowContext(ctx, expr.SQL, expr.Args...), nil
+	}, configs...)
+}
+
+// Query returns a Statement that runs the query and returns *sql.Rows.
+func Query[Param any](configs ...Config) Statement[Param, *sql.Rows] {
+	return newStmt[Param](false, func(ctx context.Context, db DB, expr Expression[any]) (*sql.Rows, error) {
+		return db.QueryContext(ctx, expr.SQL, expr.Args...)
+	}, configs...)
+}
+
+// First returns a Statement that maps the first row from a query to Dest.
+func First[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db DB, expr Expression[Dest]) (result Dest, err error) {
+		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return result, err
+		}
+
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, rows.Close())
+			} else {
+				err = rows.Close()
+			}
+		}()
+
+		return expr.Schema.First(rows)
+	}, configs...)
+}
+
+// One returns a Statement that expects exactly one row in the result set.
+// It returns an structscan.ErrTooManyRows if more than one row is returned.
+func One[Param any, Dest any](configs ...Config) Statement[Param, Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db DB, expr Expression[Dest]) (result Dest, err error) {
+		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return *new(Dest), err
+		}
+
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, rows.Close())
+			} else {
+				err = rows.Close()
+			}
+		}()
+
+		return expr.Schema.One(rows)
+	}, configs...)
+}
+
+// All returns a Statement that maps all rows in the result set to a slice of Dest.
+func All[Param any, Dest any](configs ...Config) Statement[Param, []Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db DB, expr Expression[Dest]) (result []Dest, err error) {
+		rows, err := db.QueryContext(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, rows.Close())
+			} else {
+				err = rows.Close()
+			}
+		}()
+
+		return expr.Schema.All(rows)
+	}, configs...)
+}
+
 // Custom creates a Statement using the provided function to execute the rendered SQL expression.
 // This allows advanced behavior such as custom row scanning or side effects.
 func Custom[Param any, Dest any, Result any](exec func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error), configs ...Config) Statement[Param, Result] {
-	return newStmt[Param](exec, configs...)
+	return newStmt[Param](true, exec, configs...)
 }
 
-var Global = map[string]any{
-	"DateTime":    func() string { return time.DateTime },
-	"DateOnly":    func() string { return time.DateOnly },
-	"TimeOnly":    func() string { return time.TimeOnly },
-	"RFC3339":     func() string { return time.RFC3339 },
-	"RFC3339Nano": func() string { return time.RFC3339Nano },
-	"Layout":      func() string { return time.Layout },
-	"ANSIC":       func() string { return time.ANSIC },
-	"UnixDate":    func() string { return time.UnixDate },
-	"RubyDate":    func() string { return time.RubyDate },
-	"RFC822":      func() string { return time.RFC822 },
-	"RFC822Z":     func() string { return time.RFC822Z },
-	"RFC850":      func() string { return time.RFC850 },
-	"RFC1123":     func() string { return time.RFC1123 },
-	"RFC1123Z":    func() string { return time.RFC1123Z },
-	"Kitchen":     func() string { return time.Kitchen },
-	"Stamp":       func() string { return time.Stamp },
-	"StampMilli":  func() string { return time.StampMilli },
-	"StampMicro":  func() string { return time.StampMicro },
-	"StampNano":   func() string { return time.StampNano },
-	"UTC":         func() *time.Location { return time.UTC },
-	"Local":       func() *time.Location { return time.Local }, //nolint:gosmopolitan
-	"TextArray": func() func() structscan.Assigner {
-		return func() structscan.Assigner {
-			return &pgtype.TextArray{}
+type PgxStatement[Param, Result any] interface {
+	Exec(ctx context.Context, db Pgx, param Param) (Result, error)
+}
+
+// Exec returns a Statement that executes a SQL statement without returning rows.
+func ExecPgx[Param any](configs ...Config) PgxStatement[Param, pgconn.CommandTag] {
+	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgconn.CommandTag, error) {
+		return db.Exec(ctx, expr.SQL, expr.Args...)
+	}, configs...)
+}
+
+// QueryRow returns a Statement that runs the query and returns a single *sql.Row.
+func QueryRowPgx[Param any](configs ...Config) PgxStatement[Param, pgx.Row] {
+	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgx.Row, error) {
+		return db.QueryRow(ctx, expr.SQL, expr.Args...), nil
+	}, configs...)
+}
+
+// Query returns a Statement that runs the query and returns *sql.Rows.
+func QueryPgx[Param any](configs ...Config) PgxStatement[Param, pgx.Rows] {
+	return newStmt[Param](false, func(ctx context.Context, db Pgx, expr Expression[any]) (pgx.Rows, error) {
+		return db.Query(ctx, expr.SQL, expr.Args...)
+	}, configs...)
+}
+
+// First returns a Statement that maps the first row from a query to Dest.
+func FirstPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) (Dest, error) {
+		rows, err := db.Query(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return *new(Dest), err
 		}
-	},
+
+		defer rows.Close()
+
+		return expr.Schema.First(rows)
+	}, configs...)
 }
 
-func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error), configs ...Config) Statement[Param, Result] {
+// One returns a Statement that expects exactly one row in the result set.
+// It returns an structscan.ErrTooManyRows if more than one row is returned.
+func OnePgx[Param any, Dest any](configs ...Config) PgxStatement[Param, Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) (Dest, error) {
+		rows, err := db.Query(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return *new(Dest), err
+		}
+
+		defer rows.Close()
+
+		return expr.Schema.One(rows)
+	}, configs...)
+}
+
+// All returns a Statement that maps all rows in the result set to a slice of Dest.
+func AllPgx[Param any, Dest any](configs ...Config) PgxStatement[Param, []Dest] {
+	return newStmt[Param](true, func(ctx context.Context, db Pgx, expr Expression[Dest]) ([]Dest, error) {
+		rows, err := db.Query(ctx, expr.SQL, expr.Args...)
+		if err != nil {
+			return nil, err
+		}
+
+		defer rows.Close()
+
+		return expr.Schema.All(rows)
+	}, configs...)
+}
+
+// Custom creates a Statement using the provided function to execute the rendered SQL expression.
+// This allows advanced behavior such as custom row scanning or side effects.
+func CustomPgx[Param any, Dest any, Result any](exec func(ctx context.Context, db Pgx, expr Expression[Dest]) (Result, error), configs ...Config) PgxStatement[Param, Result] {
+	return newStmt[Param](true, exec, configs...)
+}
+
+func newStmt[Param any, Dest any, Result any, Database any](withScanners bool, exec func(ctx context.Context, db Database, expr Expression[Dest]) (Result, error), configs ...Config) *statement[Param, Dest, Result, Database] {
 	_, file, line, _ := runtime.Caller(2)
 
 	var (
 		location = file + ":" + strconv.Itoa(line)
 		config   = Question().With(configs...)
-		schema   = structscan.NewSchema[Dest]()
 
 		t = template.New("").Option("missingkey=invalid").Funcs(template.FuncMap{
-			"Raw":  func(sql string) Raw { return Raw(sql) },
-			"Scan": schema.Scan,
+			"Raw": func(sql string) Raw { return Raw(sql) },
+		})
+		err error
+	)
 
+	if withScanners {
+		t = t.Funcs(template.FuncMap{
+			"Scan": structscan.Scan,
 			"Enum": func(s string, i int64) structscan.Enum {
 				return structscan.Enum{
 					String: s,
 					Int:    i,
 				}
 			},
-		}).Funcs(Global)
-		err error
-	)
+			"DateTime":    func() string { return time.DateTime },
+			"DateOnly":    func() string { return time.DateOnly },
+			"TimeOnly":    func() string { return time.TimeOnly },
+			"RFC3339":     func() string { return time.RFC3339 },
+			"RFC3339Nano": func() string { return time.RFC3339Nano },
+			"Layout":      func() string { return time.Layout },
+			"ANSIC":       func() string { return time.ANSIC },
+			"UnixDate":    func() string { return time.UnixDate },
+			"RubyDate":    func() string { return time.RubyDate },
+			"RFC822":      func() string { return time.RFC822 },
+			"RFC822Z":     func() string { return time.RFC822Z },
+			"RFC850":      func() string { return time.RFC850 },
+			"RFC1123":     func() string { return time.RFC1123 },
+			"RFC1123Z":    func() string { return time.RFC1123Z },
+			"Kitchen":     func() string { return time.Kitchen },
+			"Stamp":       func() string { return time.Stamp },
+			"StampMilli":  func() string { return time.StampMilli },
+			"StampMicro":  func() string { return time.StampMicro },
+			"StampNano":   func() string { return time.StampNano },
+			"UTC":         func() *time.Location { return time.UTC },
+			//nolint:gosmopolitan
+			"Local": func() *time.Location { return time.Local },
+		})
+	}
 
 	for _, p := range config.Parsers {
 		t, err = p(t)
@@ -458,7 +574,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 		panic(fmt.Errorf("statement at %s: check template: %w", location, err))
 	}
 
-	if err = escapeNode(schema, t, t.Root); err != nil {
+	if err := escapeNode(t, t.Root); err != nil {
 		panic(fmt.Errorf("statement at %s: escape template: %w", location, err))
 	}
 
@@ -472,8 +588,9 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 			tc, _ := t.Clone()
 
 			r := &runner[Param, Dest]{
-				tpl:     tc,
-				builder: &strings.Builder{},
+				withScanners: withScanners,
+				tpl:          tc,
+				builder:      &strings.Builder{},
 			}
 
 			r.builder.Grow(512)
@@ -485,7 +602,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 						_, err := r.builder.WriteString(string(a))
 
 						return "", err
-					case structscan.Scanner[Dest]:
+					case structscan.Scanner:
 						r.scanners = append(r.scanners, a)
 
 						return "", nil
@@ -501,23 +618,10 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 		},
 	}
 
-	var cache *otter.Cache[uint64, Expression[Dest]]
+	var cache *expirable.LRU[uint64, Expression[Dest]]
 
 	if config.ExpressionSize > 0 || config.ExpressionExpiration > 0 {
-		opts := &otter.Options[uint64, Expression[Dest]]{}
-
-		if config.ExpressionSize > 0 {
-			opts.MaximumSize = config.ExpressionSize
-		}
-
-		if config.ExpressionExpiration > 0 {
-			opts.ExpiryCalculator = otter.ExpiryAccessing[uint64, Expression[Dest]](config.ExpressionExpiration)
-		}
-
-		cache, err = otter.New(opts)
-		if err != nil {
-			panic(fmt.Errorf("statement at %s: create expression cache: %w", location, err))
-		}
+		cache = expirable.NewLRU[uint64, Expression[Dest]](config.ExpressionSize, nil, config.ExpressionExpiration)
 
 		if config.Hasher == nil {
 			hasher := datahash.New(xxhash.New, datahash.Options{})
@@ -531,7 +635,7 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 		}
 	}
 
-	return &statement[Param, Dest, Result]{
+	return &statement[Param, Dest, Result, Database]{
 		name:     t.Name(),
 		location: location,
 		cache:    cache,
@@ -544,17 +648,17 @@ func newStmt[Param any, Dest any, Result any](exec func(ctx context.Context, db 
 
 // statement is the internal implementation of Statement.
 // It holds compiled templates, a result executor, and optional caching/logging.
-type statement[Param any, Dest any, Result any] struct {
+type statement[Param any, Dest any, Result any, Database any] struct {
 	name     string
 	location string
-	cache    *otter.Cache[uint64, Expression[Dest]]
-	exec     func(ctx context.Context, db DB, expr Expression[Dest]) (Result, error)
+	cache    *expirable.LRU[uint64, Expression[Dest]]
+	exec     func(ctx context.Context, db Database, expr Expression[Dest]) (Result, error)
 	pool     *sync.Pool
 	logger   func(ctx context.Context, info Info)
 	hasher   func(value any) (uint64, error)
 }
 
-func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param Param) (result Result, err error) {
+func (s *statement[Param, Dest, Result, Database]) Exec(ctx context.Context, db Database, param Param) (result Result, err error) {
 	var (
 		expr   Expression[Dest]
 		hash   uint64
@@ -583,7 +687,7 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 			return result, fmt.Errorf("statement at %s: hashing param: %w", s.location, err)
 		}
 
-		expr, cached = s.cache.GetIfPresent(hash)
+		expr, cached = s.cache.Get(hash)
 		if cached {
 			result, err = s.exec(ctx, db, expr)
 			if err != nil {
@@ -608,7 +712,7 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 	s.pool.Put(r)
 
 	if s.cache != nil {
-		_, _ = s.cache.Set(hash, expr)
+		_ = s.cache.Add(hash, expr)
 	}
 
 	result, err = s.exec(ctx, db, expr)
@@ -621,14 +725,14 @@ func (s *statement[Param, Dest, Result]) Exec(ctx context.Context, db DB, param 
 
 // escapeNode rewrites template nodes to capture SQL fragments, scan targets, and arguments.
 // Inspired by https://github.com/mhilton/sqltemplate/blob/main/escape.go.
-func escapeNode[Dest any](s *structscan.Schema[Dest], t *template.Template, n parse.Node) error {
+func escapeNode(t *template.Template, n parse.Node) error {
 	switch v := n.(type) {
 	case *parse.ActionNode:
-		return escapeNode(s, t, v.Pipe)
+		return escapeNode(t, v.Pipe)
 	case *parse.IfNode:
 		return errors.Join(
-			escapeNode(s, t, v.List),
-			escapeNode(s, t, v.ElseList),
+			escapeNode(t, v.List),
+			escapeNode(t, v.ElseList),
 		)
 	case *parse.ListNode:
 		if v == nil {
@@ -636,7 +740,7 @@ func escapeNode[Dest any](s *structscan.Schema[Dest], t *template.Template, n pa
 		}
 
 		for _, n := range v.Nodes {
-			if err := escapeNode(s, t, n); err != nil {
+			if err := escapeNode(t, n); err != nil {
 				return err
 			}
 		}
@@ -660,13 +764,13 @@ func escapeNode[Dest any](s *structscan.Schema[Dest], t *template.Template, n pa
 		})
 	case *parse.RangeNode:
 		return errors.Join(
-			escapeNode(s, t, v.List),
-			escapeNode(s, t, v.ElseList),
+			escapeNode(t, v.List),
+			escapeNode(t, v.ElseList),
 		)
 	case *parse.WithNode:
 		return errors.Join(
-			escapeNode(s, t, v.List),
-			escapeNode(s, t, v.ElseList),
+			escapeNode(t, v.List),
+			escapeNode(t, v.ElseList),
 		)
 	case *parse.TemplateNode:
 		tpl := t.Lookup(v.Name)
@@ -674,7 +778,7 @@ func escapeNode[Dest any](s *structscan.Schema[Dest], t *template.Template, n pa
 			return fmt.Errorf("template %s not found", v.Name)
 		}
 
-		return escapeNode(s, tpl, tpl.Root)
+		return escapeNode(tpl, tpl.Root)
 	}
 
 	return nil
@@ -684,27 +788,30 @@ const ident = "__sqlt__"
 
 // runner holds the state for a single template execution.
 type runner[Param any, Dest any] struct {
-	tpl      *template.Template
-	builder  *strings.Builder
-	args     []any
-	scanners []structscan.Scanner[Dest]
+	tpl          *template.Template
+	builder      *strings.Builder
+	args         []any
+	withScanners bool
+	scanners     []structscan.Scanner
 }
 
 // expr renders the template and collects SQL, args, and structscan mappers.
 func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
-	if err := r.tpl.Execute(r.builder, param); err != nil {
-		return Expression[Dest]{}, err
-	}
-
-	mapper, err := structscan.NewMapper(r.scanners...)
+	err := r.tpl.Execute(r.builder, param)
 	if err != nil {
 		return Expression[Dest]{}, err
 	}
 
 	expr := Expression[Dest]{
-		SQL:    r.builder.String(),
-		Args:   slices.Clone(r.args),
-		Mapper: mapper,
+		SQL:  r.builder.String(),
+		Args: slices.Clone(r.args),
+	}
+
+	if r.withScanners {
+		expr.Schema, err = structscan.New[Dest](r.scanners...)
+		if err != nil {
+			return Expression[Dest]{}, err
+		}
 	}
 
 	return expr, nil

@@ -23,6 +23,7 @@ linters:
     - depguard
     - cyclop
     - nestif
+    - rowserrcheck
   exclusions:
     paths-except:
       - main.go
