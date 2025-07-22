@@ -538,7 +538,7 @@ func newStmt[Param any, Dest any, Result any, Database any](withScanners bool, e
 
 	if withScanners {
 		t = t.Funcs(template.FuncMap{
-			"Scan": structscan.Scan,
+			"Scan": structscan.Scan[Dest],
 			"Enum": func(s string, i int64) structscan.Enum {
 				return structscan.Enum{
 					String: s,
@@ -816,10 +816,7 @@ func (r *runner[Param, Dest]) expr(param Param) (Expression[Dest], error) {
 	}
 
 	if r.withScanners {
-		expr.Schema, err = structscan.New[Dest](r.scanners...)
-		if err != nil {
-			return Expression[Dest]{}, err
-		}
+		expr.Schema = structscan.New[Dest](r.scanners...)
 	}
 
 	return expr, nil

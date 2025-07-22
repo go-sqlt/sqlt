@@ -10,7 +10,7 @@ go get -u github.com/go-sqlt/sqlt
 
 `sqlt` uses Go’s template engine to create a flexible, powerful, and type-safe SQL builder and struct mapper.  
 
-Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function (`== structscan.Scan()`) provides a fluent API for field-based value extraction and transformation.
+Struct mapping is handled by the [structscan](https://pkg.go.dev/github.com/go-sqlt/structscan) package. The `Scan` function (`== structscan.Scan[Dest]()`) provides a fluent API for field-based value extraction and transformation.
 
 ## Example
 
@@ -45,7 +45,7 @@ var query = sqlt.All[string, Data](sqlt.Parse(`
 		100                                    {{ Scan.Int.To "Int" }}
 		, NULL                                 {{ Scan.Nullable.String.To "String" }}
 		, true                                 {{ Scan.Bool.To "Bool" }}
-		, {{ . }}                              {{ (Scan.String.Time DateOnly).To "Time" }}
+		, {{ . }}                              {{ (Scan.String.ParseTime DateOnly).To "Time" }}
 		, '300'                                {{ Scan.Text.To "Big" }}
 		, 'https://example.com/path?query=yes' {{ Scan.Binary.To "URL" }}
 		, 'hello,world'                        {{ (Scan.String.Split ",").To "Slice" }}
@@ -63,6 +63,6 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println(data) // [{100 default true 2025-05-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
+	fmt.Println(data) // [{100  true 2025-07-22 00:00:00 +0000 UTC 300 https://example.com/path?query=yes [hello world] map[hello:world]}]
 }
 ```
