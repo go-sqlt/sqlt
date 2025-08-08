@@ -536,39 +536,37 @@ func newStmt[Param any, Dest any, Result any, Database any](withScanners bool, e
 		err error
 	)
 
-	if withScanners {
-		t = t.Funcs(template.FuncMap{
-			"Scan": structscan.Scan[Dest],
-			"Enum": func(s string, i int64) structscan.Enum {
-				return structscan.Enum{
-					String: s,
-					Int:    i,
-				}
-			},
-			"DateTime":    func() string { return time.DateTime },
-			"DateOnly":    func() string { return time.DateOnly },
-			"TimeOnly":    func() string { return time.TimeOnly },
-			"RFC3339":     func() string { return time.RFC3339 },
-			"RFC3339Nano": func() string { return time.RFC3339Nano },
-			"Layout":      func() string { return time.Layout },
-			"ANSIC":       func() string { return time.ANSIC },
-			"UnixDate":    func() string { return time.UnixDate },
-			"RubyDate":    func() string { return time.RubyDate },
-			"RFC822":      func() string { return time.RFC822 },
-			"RFC822Z":     func() string { return time.RFC822Z },
-			"RFC850":      func() string { return time.RFC850 },
-			"RFC1123":     func() string { return time.RFC1123 },
-			"RFC1123Z":    func() string { return time.RFC1123Z },
-			"Kitchen":     func() string { return time.Kitchen },
-			"Stamp":       func() string { return time.Stamp },
-			"StampMilli":  func() string { return time.StampMilli },
-			"StampMicro":  func() string { return time.StampMicro },
-			"StampNano":   func() string { return time.StampNano },
-			"UTC":         func() *time.Location { return time.UTC },
-			//nolint:gosmopolitan
-			"Local": func() *time.Location { return time.Local },
-		})
-	}
+	t = t.Funcs(template.FuncMap{
+		"Scan": structscan.Scan[Dest],
+		"Enum": func(s string, i int64) structscan.Enum {
+			return structscan.Enum{
+				String: s,
+				Int:    i,
+			}
+		},
+		"DateTime":    func() string { return time.DateTime },
+		"DateOnly":    func() string { return time.DateOnly },
+		"TimeOnly":    func() string { return time.TimeOnly },
+		"RFC3339":     func() string { return time.RFC3339 },
+		"RFC3339Nano": func() string { return time.RFC3339Nano },
+		"Layout":      func() string { return time.Layout },
+		"ANSIC":       func() string { return time.ANSIC },
+		"UnixDate":    func() string { return time.UnixDate },
+		"RubyDate":    func() string { return time.RubyDate },
+		"RFC822":      func() string { return time.RFC822 },
+		"RFC822Z":     func() string { return time.RFC822Z },
+		"RFC850":      func() string { return time.RFC850 },
+		"RFC1123":     func() string { return time.RFC1123 },
+		"RFC1123Z":    func() string { return time.RFC1123Z },
+		"Kitchen":     func() string { return time.Kitchen },
+		"Stamp":       func() string { return time.Stamp },
+		"StampMilli":  func() string { return time.StampMilli },
+		"StampMicro":  func() string { return time.StampMicro },
+		"StampNano":   func() string { return time.StampNano },
+		"UTC":         func() *time.Location { return time.UTC },
+		//nolint:gosmopolitan
+		"Local": func() *time.Location { return time.Local },
+	})
 
 	for _, p := range config.Parsers {
 		t, err = p(t)
