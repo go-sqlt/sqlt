@@ -6,6 +6,7 @@ run:
 linters:
   default: all
   disable:
+    - wsl
     - wrapcheck
     - varnamelen
     - revive
